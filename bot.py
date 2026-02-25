@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatType, ParseMode
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -46,7 +47,7 @@ WEIGH_HOUR = int(os.getenv("WEIGH_HOUR", "10"))
 WEIGH_MIN = int(os.getenv("WEIGH_MIN", "0"))
 
 storage = MemoryStorage()
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=storage)
 
 # =======================
@@ -56,20 +57,18 @@ WEIGHT_RE = re.compile(r"(?:^|\b)(?:вес\s*)?(\d{2,3}(?:[.,]\d)?)\b", re.IGNOR
 STEPS_RE = re.compile(r"(?:^|\b)(\d{3,6})\s*(?:шаг(?:ов|а)?|steps)?\b", re.IGNORECASE)
 
 ASK_MY_WEIGHT_RE = re.compile(r"(какой\s+мой\s+вес|мой\s+вес\s+сейчас|сколько\s+я\s+вешу)", re.IGNORECASE)
-ASK_EATEN_TODAY_RE = re.compile(r"(сколько\s+я\s+съел|сколько\s+я\s+съела|сколько\s+калори(й|и)\s+сегодня\s+съел|сколько\s+калори(й|и)\s+сегодня\s+съела|сколько\s+я\s+съел\s+сегодня|сколько\s+я\s+съела\s+сегодня)", re.IGNORECASE)
-ASK_BURNED_TODAY_RE = re.compile(r"(сколько\s+я\s+сж(е|ё)г|сколько\s+я\s+израсходовал|сколько\s+я\s+потратил|калори(й|и)\s+сж(е|ё)г\s+сегодня|израсходовал\s+сегодня|потратил\s+сегодня)", re.IGNORECASE)
+ASK_EATEN_TODAY_RE = re.compile(r"(сколько\s+я\s+съел|сколько\s+я\s+съела|сколько\s+калори(й|и)\s+сегодня)", re.IGNORECASE)
+ASK_BURNED_TODAY_RE = re.compile(r"(сколько\s+я\s+сж(е|ё)г|сколько\s+я\s+израсходовал|сколько\s+я\s+потратил|сж(е|ё)г\s+сегодня|потратил\s+сегодня)", re.IGNORECASE)
 ASK_BALANCE_RE = re.compile(r"(баланс\s+калори(й|и)|профицит|дефицит)\b", re.IGNORECASE)
 
-# калории строка: "Калории: 650-850 ккал"
 CAL_RANGE_RE = re.compile(r"Калор(ии|ий|ии):\s*([0-9]{2,4})\s*[-–]\s*([0-9]{2,4})", re.IGNORECASE)
 
-# исправления (сообщение должно быть reply к сообщению бота)
+# исправление должно быть reply на сообщение бота
 CORRECT_RE = re.compile(r"^(исправь|это|на\s*фото)\s*:\s*(.+)$", re.IGNORECASE)
 
 DEFAULT_RULES = (
     "Я оцениваю еду по: белок / овощи(клетчатка) / сладкое / жирное / порция / соусы.\n"
-    "Отвечаю форматом:\n"
-    "Блюдо / Оценка 1–10 / Калории (примерно диапазоном) / Почему / Совет.\n"
+    "Формат: Блюдо / Оценка 1–10 / Калории (диапазоном) / Почему / Совет.\n"
     "Калории по фото — всегда приблизительно."
 )
 
@@ -107,8 +106,7 @@ def parse_kcal_range(text: str):
     m = CAL_RANGE_RE.search(text or "")
     if not m:
         return (None, None)
-    low = int(m.group(2))
-    high = int(m.group(3))
+    low = int(m.group(2)); high = int(m.group(3))
     if low > high:
         low, high = high, low
     return (low, high)
@@ -128,8 +126,7 @@ def snacking_warning(meals_rows):
         return None
     if len(meals_rows) >= 5:
         return ("Похоже, сегодня очень часто ешь (много перекусов). "
-                "Если это «на автомате», попробуй: 2–3 основных приёма + один нормальный перекус "
-                "(белок + клетчатка), чтобы реже тянуло есть.")
+                "Попробуй 2–3 основных приёма + один нормальный перекус (белок + клетчатка).")
     times = []
     for dt_str, *_ in meals_rows:
         try:
@@ -138,9 +135,8 @@ def snacking_warning(meals_rows):
             pass
     for i in range(len(times) - 2):
         if (times[i + 2] - times[i]) <= timedelta(hours=2):
-            return ("Вижу несколько приёмов пищи очень близко по времени. "
-                    "Если хочешь — сделаем перекус более «сытным» (белок + клетчатка), "
-                    "чтобы реже хотелось есть.")
+            return ("Несколько приёмов пищи очень близко по времени. "
+                    "Сделай перекус более «сытным» (белок + клетчатка), чтобы реже хотелось есть.")
     return None
 
 # =======================
@@ -186,7 +182,6 @@ async def init_db():
             steps INTEGER
         )""")
 
-        # message_id — id сообщения бота с оценкой, чтобы потом найти при reply
         await db.execute("""
         CREATE TABLE IF NOT EXISTS meals(
             chat_id INTEGER,
@@ -198,7 +193,6 @@ async def init_db():
             bot_message_id INTEGER
         )""")
 
-        # история исправлений
         await db.execute("""
         CREATE TABLE IF NOT EXISTS meal_corrections(
             chat_id INTEGER,
@@ -341,7 +335,7 @@ async def log_correction(chat_id: int, user_id: int, bot_message_id: int, correc
         await db.commit()
 
 # =======================
-# Groq analyze (vision + text)
+# Groq analyze
 # =======================
 async def groq_chat(messages):
     resp = groq_client.chat.completions.create(
@@ -382,7 +376,6 @@ async def analyze_food(photo_file_id: str, goal: str, user_context: str, caption
 4) Почему (1–2 предложения).
 5) 1 конкретный совет.
 
-Без давления и жестких диет.
 Формат строго:
 Блюдо:
 Оценка:
@@ -392,28 +385,26 @@ async def analyze_food(photo_file_id: str, goal: str, user_context: str, caption
 """.strip()
 
     try:
-        return await groq_chat([
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            }
-        ]) or "Не смог распознать по фото 😅 Попробуй другое фото или подпиши."
+        text = await groq_chat([
+            {"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ]}
+        ])
+        return text if text else "Не смог распознать по фото 😅 Попробуй другое фото или подпиши."
     except Exception as e:
         err = repr(e)
         print("Groq error:", err)
-        hint = "Не смог обработать фото 😅"
         low = err.lower()
-        if "401" in low or "unauthorized" in low or "invalid api key" in low:
-            hint = "Не могу обратиться к Groq: проблема с API ключом (проверь GROQ_API_KEY)."
+        hint = "Не смог обработать фото 😅"
+        if "401" in low or "unauthorized" in low:
+            hint = "Проблема с GROQ_API_KEY (401)."
         elif "429" in low or "rate" in low or "quota" in low:
-            hint = "Groq ограничил запросы (лимит/частота). Подожди немного и попробуй снова."
+            hint = "Groq ограничил запросы (429/лимит)."
         elif "model" in low and ("not found" in low or "does not exist" in low):
             hint = "Модель Groq не найдена. Проверь GROQ_MODEL."
         elif "timeout" in low:
-            hint = "Groq долго отвечает (таймаут). Попробуй ещё раз через 10–20 секунд."
+            hint = "Таймаут Groq. Попробуй ещё раз."
         return f"⚠️ {hint}" + (f"\n\nDEBUG: {err[:240]}" if DEBUG else "")
 
 async def reanalyze_from_text(goal: str, user_context: str, correction_text: str):
@@ -439,10 +430,9 @@ async def reanalyze_from_text(goal: str, user_context: str, correction_text: str
 """.strip()
 
     try:
-        return await groq_chat([{"role": "user", "content": prompt}]) or "Ок, принял уточнение ✅"
-    except Exception as e:
-        err = repr(e)
-        print("Groq error (text):", err)
+        text = await groq_chat([{"role": "user", "content": prompt}])
+        return text if text else "Ок, принял уточнение ✅"
+    except Exception:
         return "⚠️ Не смог пересчитать по уточнению. Попробуй ещё раз позже."
 
 # =======================
@@ -556,7 +546,7 @@ async def cmd_linkprofile(msg: Message):
     await msg.reply(f"{name}, профиль привязан ✅")
 
 # =======================
-# Q&A in group
+# Q&A
 # =======================
 async def answer_questions(msg: Message, mention: str, prof):
     chat_id = msg.chat.id
@@ -599,24 +589,22 @@ async def answer_questions(msg: Message, mention: str, prof):
     if ASK_BALANCE_RE.search(text):
         rows = await meals_today(chat_id, user_id)
         intake = 0
-        known = 0
         for _, _, low, high, _ in rows:
             mid = kcal_mid(low, high)
             if mid is not None:
                 intake += mid
-                known += 1
         steps = await steps_today(chat_id, user_id)
         weight_kg = float(prof[2]) if prof else None
         burned = estimate_burned_kcal_from_steps(steps, weight_kg)
         balance = intake - burned
         sign = "+" if balance > 0 else ""
-        await msg.reply(f"{mention}, баланс сегодня (очень примерно): {sign}{balance} ккал.\nСъел ~{intake}, Сжёг шагами ~{burned}.")
+        await msg.reply(f"{mention}, баланс сегодня (очень примерно): {sign}{balance} ккал.\nСъел ~{intake}, Сжёг ~{burned}.")
         return True
 
     return False
 
 # =======================
-# Corrections handler
+# Handlers
 # =======================
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}) & F.text)
 async def on_text(msg: Message):
@@ -628,28 +616,23 @@ async def on_text(msg: Message):
     name = prof[0] if prof else (msg.from_user.first_name or "Ты")
     mention = mention_user_html(msg, name)
 
-    # 1) исправления: только если это reply на сообщение бота
+    # Исправления: reply на сообщение бота
     m = CORRECT_RE.match(t)
     if m and msg.reply_to_message and msg.reply_to_message.from_user and msg.reply_to_message.from_user.is_bot:
         correction_text = m.group(2).strip()
         bot_msg_id = msg.reply_to_message.message_id
 
-        # найдём meal, который бот записал под этим bot_message_id
         meal = await find_meal_by_bot_message(msg.chat.id, bot_msg_id)
         if not meal:
-            return await msg.reply(f"{mention}, не нашёл запись еды для этого сообщения. Попробуй ответить на самое последнее сообщение бота с оценкой.")
+            return await msg.reply(f"{mention}, не нашёл запись еды для этого сообщения. Ответь на сообщение бота с оценкой.")
 
-        # контекст для персонализации
         user_context = "нет"
         if prof:
             user_context = f"Имя: {prof[0]}, Рост: {prof[1]} см, Вес: {prof[2]} кг"
         goal = await get_goal(msg.chat.id)
 
-        # пересчитаем только по тексту (быстро)
         new_analysis = await reanalyze_from_text(goal, user_context, correction_text)
         low, high = parse_kcal_range(new_analysis)
-
-        # title — берем из коррекции
         new_title = correction_text[:120]
 
         await log_correction(msg.chat.id, user_id, bot_msg_id, correction_text)
@@ -657,11 +640,11 @@ async def on_text(msg: Message):
 
         return await msg.reply(f"{mention}, принял исправление ✅\n\n{new_analysis}")
 
-    # 2) вопросы
+    # Вопросы
     if await answer_questions(msg, mention, prof):
         return
 
-    # 3) вес
+    # Вес
     mw = WEIGHT_RE.search(t)
     if mw:
         raw = mw.group(1).replace(",", ".")
@@ -673,7 +656,7 @@ async def on_text(msg: Message):
             await save_weight(msg.chat.id, user_id, w)
             return await msg.reply(f"{mention}, вес записал: {w:.1f} кг ✅")
 
-    # 4) шаги
+    # Шаги
     ms = STEPS_RE.search(t)
     if ms:
         s = int(ms.group(1))
@@ -699,16 +682,15 @@ async def on_food_photo(msg: Message):
     analysis = await analyze_food(msg.photo[-1].file_id, goal, user_context, msg.caption)
 
     low, high = parse_kcal_range(analysis)
-
     title = (msg.caption or "").strip()
     if not title:
-        m = re.search(r"Блюдо:\s*(.+)", analysis)
-        title = m.group(1).strip() if m else "Еда"
+        mm = re.search(r"Блюдо:\s*(.+)", analysis)
+        title = mm.group(1).strip() if mm else "Еда"
 
     today_rows = await meals_today(msg.chat.id, user_id)
-    # reply сначала, потом сохраним с bot_message_id
+    warn = snacking_warning([(r[0], r[1], r[2], r[3]) for r in today_rows] + [(datetime.now(TZ).isoformat(), title, low, high)])
+
     out = f"{mention}, вот что вижу:\n\n{analysis}"
-    warn = snacking_warning(today_rows + [("temp", title, low, high, -1)])
     if warn:
         out += f"\n\n🟡 {warn}"
 
