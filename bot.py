@@ -10,13 +10,14 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatType, ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from openai import OpenAI
+
 
 # =======================
 # CONFIG
@@ -63,13 +64,13 @@ ASK_BALANCE_RE = re.compile(r"(баланс\s+калори(й|и)|профици
 
 CAL_RANGE_RE = re.compile(r"Калор(ии|ий|ии):\s*([0-9]{2,4})\s*[-–]\s*([0-9]{2,4})", re.IGNORECASE)
 
-# исправление должно быть reply на сообщение бота
-CORRECT_RE = re.compile(r"^(исправь|это|на\s*фото)\s*:\s*(.+)$", re.IGNORECASE)
+# Текстовая правка (если reply)
+CORRECT_PREFIX_RE = re.compile(r"^(исправь|это|на\s*фото)\s*:?\s*(.+)$", re.IGNORECASE)
 
 DEFAULT_RULES = (
     "Я оцениваю еду по: белок / овощи(клетчатка) / сладкое / жирное / порция / соусы.\n"
     "Формат: Блюдо / Оценка 1–10 / Калории (диапазоном) / Почему / Совет.\n"
-    "Калории по фото — всегда приблизительно."
+    "Калории по фото — приблизительно."
 )
 
 # =======================
@@ -79,6 +80,7 @@ class ProfileFlow(StatesGroup):
     name = State()
     height = State()
     weight = State()
+
 
 # =======================
 # Helpers
@@ -122,13 +124,14 @@ def estimate_burned_kcal_from_steps(steps: int, weight_kg: float | None):
     return int(round(steps * base_per_step * factor))
 
 def snacking_warning(meals_rows):
+    # meals_rows: list of dt strings sorted asc
     if not meals_rows:
         return None
     if len(meals_rows) >= 5:
-        return ("Похоже, сегодня очень часто ешь (много перекусов). "
-                "Попробуй 2–3 основных приёма + один нормальный перекус (белок + клетчатка).")
+        return ("Похоже, сегодня слишком часто ешь (много перекусов). "
+                "Попробуй 2–3 основных приёма + 1 нормальный перекус (белок + клетчатка).")
     times = []
-    for dt_str, *_ in meals_rows:
+    for dt_str in meals_rows:
         try:
             times.append(datetime.fromisoformat(dt_str).astimezone(TZ))
         except Exception:
@@ -138,6 +141,32 @@ def snacking_warning(meals_rows):
             return ("Несколько приёмов пищи очень близко по времени. "
                     "Сделай перекус более «сытным» (белок + клетчатка), чтобы реже хотелось есть.")
     return None
+
+def extract_correction_text(text: str) -> str | None:
+    t = (text or "").strip()
+    if not t:
+        return None
+    m = CORRECT_PREFIX_RE.match(t)
+    if m:
+        return m.group(2).strip()
+
+    # "это не X а Y" -> берём Y
+    if re.match(r"^это\s+не\s+", t, flags=re.IGNORECASE):
+        m2 = re.search(r"\bа\s+(.+)$", t, flags=re.IGNORECASE)
+        if m2:
+            return m2.group(1).strip()
+
+    # короткая фраза типа "сырники"
+    if len(t) <= 80:
+        return t
+
+    return None
+
+def correction_keyboard(bot_message_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Поправить", callback_data=f"fix:{bot_message_id}")]
+    ])
+
 
 # =======================
 # DB
@@ -200,6 +229,16 @@ async def init_db():
             dt TEXT,
             bot_message_id INTEGER,
             correction_text TEXT
+        )""")
+
+        # ожидание уточнения после нажатия кнопки
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS pending_fixes(
+            chat_id INTEGER,
+            user_id INTEGER,
+            bot_message_id INTEGER,
+            created_at TEXT,
+            PRIMARY KEY(chat_id, user_id)
         )""")
 
         await db.commit()
@@ -334,6 +373,32 @@ async def log_correction(chat_id: int, user_id: int, bot_message_id: int, correc
         """, (chat_id, user_id, ts, bot_message_id, correction_text))
         await db.commit()
 
+async def set_pending_fix(chat_id: int, user_id: int, bot_message_id: int):
+    ts = datetime.now(TZ).isoformat(timespec="seconds")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO pending_fixes(chat_id, user_id, bot_message_id, created_at)
+            VALUES(?,?,?,?)
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                bot_message_id=excluded.bot_message_id,
+                created_at=excluded.created_at
+        """, (chat_id, user_id, bot_message_id, ts))
+        await db.commit()
+
+async def get_pending_fix(chat_id: int, user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT bot_message_id, created_at FROM pending_fixes
+            WHERE chat_id=? AND user_id=?
+        """, (chat_id, user_id))
+        return await cur.fetchone()
+
+async def clear_pending_fix(chat_id: int, user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM pending_fixes WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+        await db.commit()
+
+
 # =======================
 # Groq analyze
 # =======================
@@ -372,7 +437,7 @@ async def analyze_food(photo_file_id: str, goal: str, user_context: str, caption
 По фото еды:
 1) Определи блюдо (если не уверен — 2–3 варианта).
 2) Оценка 1–10.
-3) Калории диапазоном (примерно, форматом: Калории: 650-850 ккал).
+3) Калории диапазоном (формат: Калории: 650-850 ккал).
 4) Почему (1–2 предложения).
 5) 1 конкретный совет.
 
@@ -435,6 +500,7 @@ async def reanalyze_from_text(goal: str, user_context: str, correction_text: str
     except Exception:
         return "⚠️ Не смог пересчитать по уточнению. Попробуй ещё раз позже."
 
+
 # =======================
 # Commands / Profile
 # =======================
@@ -443,7 +509,7 @@ async def cmd_start(msg: Message):
     await msg.reply(
         "Я на месте ✅\n"
         "Кидай фото еды — оценю и прикину калории.\n"
-        "Если ошибся — ответь на моё сообщение: <b>исправь: ...</b>\n"
+        "Если ошибся — нажми ✏️ <b>Поправить</b> под моим ответом.\n"
         "Профиль: /profile (в личке) → затем в группе /linkprofile\n"
         "Команды: /bind /unbind /goal /rules"
     )
@@ -519,10 +585,10 @@ async def prof_weight(msg: Message, state: FSMContext):
 
     data = await state.get_data()
     name = data.get("name")
-    height = data.get("height")
+    height = int(data.get("height"))
     user_id = msg.from_user.id
 
-    await upsert_profile(0, user_id, name, int(height), float(w))
+    await upsert_profile(0, user_id, name, height, float(w))
     await state.clear()
     await msg.reply(f"Ок, {name}! Сохранил ✅\nТеперь в группе напиши /linkprofile")
 
@@ -544,6 +610,30 @@ async def cmd_linkprofile(msg: Message):
     name, h, w = row
     await upsert_profile(msg.chat.id, user_id, name, int(h), float(w))
     await msg.reply(f"{name}, профиль привязан ✅")
+
+
+# =======================
+# Inline button: "Поправить"
+# =======================
+@dp.callback_query(F.data.startswith("fix:"))
+async def cb_fix(call: CallbackQuery):
+    try:
+        bot_msg_id = int(call.data.split(":", 1)[1])
+    except Exception:
+        return await call.answer("Ошибка данных кнопки", show_alert=True)
+
+    # проверим, что такой meal есть
+    meal = await find_meal_by_bot_message(call.message.chat.id, bot_msg_id)
+    if not meal:
+        return await call.answer("Не нашёл запись для этой оценки 😅", show_alert=True)
+
+    await set_pending_fix(call.message.chat.id, call.from_user.id, bot_msg_id)
+    await call.answer("Ок")
+    await call.message.reply(
+        "✏️ Напиши, что на фото (например: <b>сырники</b> или <b>сырники 3 шт</b>). "
+        "Следующее твоё сообщение будет считаться правкой."
+    )
+
 
 # =======================
 # Q&A
@@ -603,6 +693,7 @@ async def answer_questions(msg: Message, mention: str, prof):
 
     return False
 
+
 # =======================
 # Handlers
 # =======================
@@ -616,35 +707,68 @@ async def on_text(msg: Message):
     name = prof[0] if prof else (msg.from_user.first_name or "Ты")
     mention = mention_user_html(msg, name)
 
-    # Исправления: reply на сообщение бота
-    m = CORRECT_RE.match(t)
-    if m and msg.reply_to_message and msg.reply_to_message.from_user and msg.reply_to_message.from_user.is_bot:
-        correction_text = m.group(2).strip()
-        bot_msg_id = msg.reply_to_message.message_id
+    # 1) Если есть pending-fix (после нажатия кнопки)
+    pending = await get_pending_fix(msg.chat.id, user_id)
+    if pending:
+        bot_msg_id, created_at = pending
+        # TTL 10 минут
+        try:
+            created_dt = datetime.fromisoformat(created_at).astimezone(TZ)
+        except Exception:
+            created_dt = datetime.now(TZ)
 
-        meal = await find_meal_by_bot_message(msg.chat.id, bot_msg_id)
-        if not meal:
-            return await msg.reply(f"{mention}, не нашёл запись еды для этого сообщения. Ответь на сообщение бота с оценкой.")
+        if datetime.now(TZ) - created_dt <= timedelta(minutes=10):
+            corr = extract_correction_text(t)
+            if corr:
+                meal = await find_meal_by_bot_message(msg.chat.id, bot_msg_id)
+                if not meal:
+                    await clear_pending_fix(msg.chat.id, user_id)
+                    return await msg.reply(f"{mention}, не нашёл запись для правки. Нажми ✏️ ещё раз.")
 
-        user_context = "нет"
-        if prof:
-            user_context = f"Имя: {prof[0]}, Рост: {prof[1]} см, Вес: {prof[2]} кг"
-        goal = await get_goal(msg.chat.id)
+                user_context = "нет"
+                if prof:
+                    user_context = f"Имя: {prof[0]}, Рост: {prof[1]} см, Вес: {prof[2]} кг"
+                goal = await get_goal(msg.chat.id)
 
-        new_analysis = await reanalyze_from_text(goal, user_context, correction_text)
-        low, high = parse_kcal_range(new_analysis)
-        new_title = correction_text[:120]
+                new_analysis = await reanalyze_from_text(goal, user_context, corr)
+                low, high = parse_kcal_range(new_analysis)
+                new_title = corr[:120]
 
-        await log_correction(msg.chat.id, user_id, bot_msg_id, correction_text)
-        await update_meal_by_bot_message(msg.chat.id, bot_msg_id, new_title, low, high)
+                await log_correction(msg.chat.id, user_id, bot_msg_id, corr)
+                await update_meal_by_bot_message(msg.chat.id, bot_msg_id, new_title, low, high)
+                await clear_pending_fix(msg.chat.id, user_id)
 
-        return await msg.reply(f"{mention}, принял исправление ✅\n\n{new_analysis}")
+                return await msg.reply(f"{mention}, принял уточнение ✅\n\n{new_analysis}")
+            else:
+                await clear_pending_fix(msg.chat.id, user_id)
+        else:
+            await clear_pending_fix(msg.chat.id, user_id)
 
-    # Вопросы
+    # 2) Reply-правка (если отвечают на сообщение бота)
+    if msg.reply_to_message and msg.reply_to_message.from_user and msg.reply_to_message.from_user.is_bot:
+        corr = extract_correction_text(t)
+        if corr:
+            bot_msg_id = msg.reply_to_message.message_id
+            meal = await find_meal_by_bot_message(msg.chat.id, bot_msg_id)
+            if meal:
+                user_context = "нет"
+                if prof:
+                    user_context = f"Имя: {prof[0]}, Рост: {prof[1]} см, Вес: {prof[2]} кг"
+                goal = await get_goal(msg.chat.id)
+
+                new_analysis = await reanalyze_from_text(goal, user_context, corr)
+                low, high = parse_kcal_range(new_analysis)
+                new_title = corr[:120]
+
+                await log_correction(msg.chat.id, user_id, bot_msg_id, corr)
+                await update_meal_by_bot_message(msg.chat.id, bot_msg_id, new_title, low, high)
+                return await msg.reply(f"{mention}, принял уточнение ✅\n\n{new_analysis}")
+
+    # 3) Вопросы
     if await answer_questions(msg, mention, prof):
         return
 
-    # Вес
+    # 4) Вес
     mw = WEIGHT_RE.search(t)
     if mw:
         raw = mw.group(1).replace(",", ".")
@@ -656,7 +780,7 @@ async def on_text(msg: Message):
             await save_weight(msg.chat.id, user_id, w)
             return await msg.reply(f"{mention}, вес записал: {w:.1f} кг ✅")
 
-    # Шаги
+    # 5) Шаги
     ms = STEPS_RE.search(t)
     if ms:
         s = int(ms.group(1))
@@ -688,14 +812,26 @@ async def on_food_photo(msg: Message):
         title = mm.group(1).strip() if mm else "Еда"
 
     today_rows = await meals_today(msg.chat.id, user_id)
-    warn = snacking_warning([(r[0], r[1], r[2], r[3]) for r in today_rows] + [(datetime.now(TZ).isoformat(), title, low, high)])
+    warn = snacking_warning([r[0] for r in today_rows] + [datetime.now(TZ).isoformat(timespec="seconds")])
 
     out = f"{mention}, вот что вижу:\n\n{analysis}"
     if warn:
         out += f"\n\n🟡 {warn}"
 
-    sent = await msg.reply(out)
+    sent = await msg.reply(out, reply_markup=correction_keyboard(0))  # временно, обновим ниже
+    # сохранить еду с message_id ответа бота
     await save_meal(msg.chat.id, user_id, title, low, high, sent.message_id)
+
+    # обновим кнопку, чтобы в callback был правильный message_id
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=msg.chat.id,
+            message_id=sent.message_id,
+            reply_markup=correction_keyboard(sent.message_id)
+        )
+    except Exception:
+        pass
+
 
 # =======================
 # Reminders
