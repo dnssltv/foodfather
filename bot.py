@@ -29,7 +29,7 @@ if not BOT_TOKEN:
 TZ_NAME = os.getenv("TZ", "Asia/Almaty")
 TZ = ZoneInfo(TZ_NAME)
 
-DB_PATH = os.getenv("DB_PATH", "foodbot.db")  # Railway Volume: /data/foodbot.db
+DB_PATH = os.getenv("DB_PATH", "foodbot.db")
 DEBUG = os.getenv("DEBUG", "0").strip() == "1"
 
 # Groq (OpenAI-compatible)
@@ -38,11 +38,14 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 groq_client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL) if GROQ_API_KEY else None
 
-# Reminders (Almaty)
+# Reminders
 WATER_HOUR = int(os.getenv("WATER_HOUR", "7"))
 WATER_MIN = int(os.getenv("WATER_MIN", "0"))
+
+# ВАЖНО: шаги в 22:00
 STEPS_HOUR = int(os.getenv("STEPS_HOUR", "22"))
 STEPS_MIN = int(os.getenv("STEPS_MIN", "0"))
+
 WEIGH_DOW = os.getenv("WEIGH_DOW", "sun")
 WEIGH_HOUR = int(os.getenv("WEIGH_HOUR", "10"))
 WEIGH_MIN = int(os.getenv("WEIGH_MIN", "0"))
@@ -51,20 +54,23 @@ storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=storage)
 
+
 # =======================
-# REGEX / INTENTS
+# REGEX
 # =======================
 WEIGHT_RE = re.compile(r"(?:^|\b)(?:вес\s*)?(\d{2,3}(?:[.,]\d)?)\b", re.IGNORECASE)
 STEPS_RE = re.compile(r"(?:^|\b)(\d{3,6})\s*(?:шаг(?:ов|а)?|steps)?\b", re.IGNORECASE)
 
-ASK_MY_WEIGHT_RE = re.compile(r"(какой\s+мой\s+вес|мой\s+вес\s+сейчас|сколько\s+я\s+вешу)", re.IGNORECASE)
-ASK_EATEN_TODAY_RE = re.compile(r"(сколько\s+я\s+съел|сколько\s+я\s+съела|сколько\s+калори(й|и)\s+сегодня)", re.IGNORECASE)
-ASK_BURNED_TODAY_RE = re.compile(r"(сколько\s+я\s+сж(е|ё)г|сколько\s+я\s+израсходовал|сколько\s+я\s+потратил|сж(е|ё)г\s+сегодня|потратил\s+сегодня)", re.IGNORECASE)
+ASK_MY_WEIGHT_RE = re.compile(r"(какой\s+мой\s+вес|мой\s+вес\s+сейчас|сколько\s+я\s+вешу)\b", re.IGNORECASE)
+ASK_MY_HEIGHT_RE = re.compile(r"(какой\s+мой\s+рост|мой\s+рост)\b", re.IGNORECASE)
+ASK_MY_HW_RE = re.compile(r"(какой\s+мой\s+вес\s+и\s+рост|мой\s+вес\s+и\s+рост|сколько\s+мой\s+вес\s+и\s+рост)\b", re.IGNORECASE)
+
+ASK_EATEN_TODAY_RE = re.compile(r"(сколько\s+я\s+съел|сколько\s+я\s+съела|сколько\s+калори(й|и)\s+сегодня\s+съел|сколько\s+калори(й|и)\s+сегодня\s+съела|сколько\s+калори(й|и)\s+сегодня)\b", re.IGNORECASE)
+ASK_BURNED_TODAY_RE = re.compile(r"(сколько\s+я\s+сж(е|ё)г|сколько\s+я\s+израсходовал|сколько\s+я\s+потратил|сколько\s+я\s+калори(й|и)\s+сж(е|ё)г)\b", re.IGNORECASE)
 ASK_BALANCE_RE = re.compile(r"(баланс\s+калори(й|и)|профицит|дефицит)\b", re.IGNORECASE)
+ASK_SUMMARY_RE = re.compile(r"(сводка\s+за\s+день|саммари\s+за\s+день|итоги\s+дня|итог\s+за\s+день)\b", re.IGNORECASE)
 
 CAL_RANGE_RE = re.compile(r"Калор(ии|ий|ии):\s*([0-9]{2,4})\s*[-–]\s*([0-9]{2,4})", re.IGNORECASE)
-
-# Текстовая правка (если reply)
 CORRECT_PREFIX_RE = re.compile(r"^(исправь|это|на\s*фото)\s*:?\s*(.+)$", re.IGNORECASE)
 
 DEFAULT_RULES = (
@@ -72,6 +78,7 @@ DEFAULT_RULES = (
     "Формат: Блюдо / Оценка 1–10 / Калории (диапазоном) / Почему / Совет.\n"
     "Калории по фото — приблизительно."
 )
+
 
 # =======================
 # FSM: profile
@@ -119,28 +126,10 @@ def kcal_mid(low, high):
     return int(round((low + high) / 2))
 
 def estimate_burned_kcal_from_steps(steps: int, weight_kg: float | None):
+    # Очень грубо: 0.04 ккал/шаг (70кг), масштабируем весом
     base_per_step = 0.04
     factor = (weight_kg / 70.0) if weight_kg else 1.0
     return int(round(steps * base_per_step * factor))
-
-def snacking_warning(meals_rows):
-    # meals_rows: list of dt strings sorted asc
-    if not meals_rows:
-        return None
-    if len(meals_rows) >= 5:
-        return ("Похоже, сегодня слишком часто ешь (много перекусов). "
-                "Попробуй 2–3 основных приёма + 1 нормальный перекус (белок + клетчатка).")
-    times = []
-    for dt_str in meals_rows:
-        try:
-            times.append(datetime.fromisoformat(dt_str).astimezone(TZ))
-        except Exception:
-            pass
-    for i in range(len(times) - 2):
-        if (times[i + 2] - times[i]) <= timedelta(hours=2):
-            return ("Несколько приёмов пищи очень близко по времени. "
-                    "Сделай перекус более «сытным» (белок + клетчатка), чтобы реже хотелось есть.")
-    return None
 
 def extract_correction_text(text: str) -> str | None:
     t = (text or "").strip()
@@ -150,13 +139,11 @@ def extract_correction_text(text: str) -> str | None:
     if m:
         return m.group(2).strip()
 
-    # "это не X а Y" -> берём Y
     if re.match(r"^это\s+не\s+", t, flags=re.IGNORECASE):
         m2 = re.search(r"\bа\s+(.+)$", t, flags=re.IGNORECASE)
         if m2:
             return m2.group(1).strip()
 
-    # короткая фраза типа "сырники"
     if len(t) <= 80:
         return t
 
@@ -231,7 +218,6 @@ async def init_db():
             correction_text TEXT
         )""")
 
-        # ожидание уточнения после нажатия кнопки
         await db.execute("""
         CREATE TABLE IF NOT EXISTS pending_fixes(
             chat_id INTEGER,
@@ -344,6 +330,18 @@ async def meals_today(chat_id: int, user_id: int):
             ORDER BY dt ASC
         """, (chat_id, user_id, start, end))
         return await cur.fetchall()
+
+async def total_intake_today(chat_id: int, user_id: int) -> tuple[int, int, int]:
+    """returns: (total_mid, meals_count, known_count)"""
+    rows = await meals_today(chat_id, user_id)
+    total = 0
+    known = 0
+    for _, _, low, high, _ in rows:
+        mid = kcal_mid(low, high)
+        if mid is not None:
+            total += mid
+            known += 1
+    return total, len(rows), known
 
 async def find_meal_by_bot_message(chat_id: int, bot_message_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -502,13 +500,36 @@ async def reanalyze_from_text(goal: str, user_context: str, correction_text: str
 
 
 # =======================
-# Commands / Profile
+# Summary helpers
+# =======================
+async def day_summary_text(chat_id: int, user_id: int) -> str:
+    prof = await get_profile(chat_id, user_id)
+    weight_kg = float(prof[2]) if prof else None
+
+    intake, meals_cnt, known_cnt = await total_intake_today(chat_id, user_id)
+    steps = await steps_today(chat_id, user_id)
+    burned = estimate_burned_kcal_from_steps(steps, weight_kg)
+    balance = intake - burned
+
+    sign = "+" if balance > 0 else ""
+    return (
+        f"📌 <b>Сводка за сегодня</b>\n"
+        f"🍽️ Приёмов пищи: {meals_cnt} (с калориями: {known_cnt})\n"
+        f"🔥 Съел: ~{intake} ккал\n"
+        f"🚶 Шаги: {steps} → ~{burned} ккал\n"
+        f"⚖️ Баланс: {sign}{balance} ккал (съел − шаги)\n"
+        f"ℹ️ Всё приблизительно (особенно калории по фото)."
+    )
+
+
+# =======================
+# Commands
 # =======================
 @dp.message(Command("start"))
 async def cmd_start(msg: Message):
     await msg.reply(
         "Я на месте ✅\n"
-        "Кидай фото еды — оценю и прикину калории.\n"
+        "Кидай фото еды — оценю и добавлю в дневной счётчик калорий.\n"
         "Если ошибся — нажми ✏️ <b>Поправить</b> под моим ответом.\n"
         "Профиль: /profile (в личке) → затем в группе /linkprofile\n"
         "Команды: /bind /unbind /goal /rules"
@@ -545,6 +566,10 @@ async def cmd_goal(msg: Message):
     await set_goal(msg.chat.id, parts[1])
     await msg.reply(f"Цель группы: {parts[1]} ✅")
 
+
+# =======================
+# Profile FSM
+# =======================
 @dp.message(Command("profile"))
 async def cmd_profile(msg: Message, state: FSMContext):
     if msg.chat.type != ChatType.PRIVATE:
@@ -622,7 +647,6 @@ async def cb_fix(call: CallbackQuery):
     except Exception:
         return await call.answer("Ошибка данных кнопки", show_alert=True)
 
-    # проверим, что такой meal есть
     meal = await find_meal_by_bot_message(call.message.chat.id, bot_msg_id)
     if not meal:
         return await call.answer("Не нашёл запись для этой оценки 😅", show_alert=True)
@@ -630,7 +654,7 @@ async def cb_fix(call: CallbackQuery):
     await set_pending_fix(call.message.chat.id, call.from_user.id, bot_msg_id)
     await call.answer("Ок")
     await call.message.reply(
-        "✏️ Напиши, что на фото (например: <b>сырники</b> или <b>сырники 3 шт</b>). "
+        "✏️ Напиши, что на фото (например: <b>сырники 3 шт</b>). "
         "Следующее твоё сообщение будет считаться правкой."
     )
 
@@ -643,52 +667,55 @@ async def answer_questions(msg: Message, mention: str, prof):
     user_id = msg.from_user.id
     text = (msg.text or "").strip()
 
+    if ASK_MY_HW_RE.search(text):
+        if not prof:
+            await msg.reply(f"{mention}, у меня нет твоего профиля. В личку: /profile → затем /linkprofile в группе.")
+            return True
+        await msg.reply(f"{mention}, рост: {prof[1]} см, вес: {float(prof[2]):.1f} кг.")
+        return True
+
+    if ASK_MY_HEIGHT_RE.search(text):
+        if not prof:
+            await msg.reply(f"{mention}, у меня нет твоего роста. В личку: /profile → затем /linkprofile в группе.")
+            return True
+        await msg.reply(f"{mention}, твой рост: {prof[1]} см.")
+        return True
+
     if ASK_MY_WEIGHT_RE.search(text):
         lw = await last_weight(chat_id, user_id)
-        if not lw:
-            await msg.reply(f"{mention}, у меня пока нет твоего веса. Напиши, например: 82.4")
+        if lw:
+            await msg.reply(f"{mention}, последний вес: {float(lw[1]):.1f} кг ({lw[0]}).")
             return True
-        await msg.reply(f"{mention}, последний вес: {float(lw[1]):.1f} кг ({lw[0]})")
+        if prof:
+            await msg.reply(f"{mention}, в профиле вес: {float(prof[2]):.1f} кг (обнови сообщением типа 82.4 при желании).")
+            return True
+        await msg.reply(f"{mention}, у меня пока нет твоего веса. Напиши, например: 82.4")
         return True
 
     if ASK_EATEN_TODAY_RE.search(text):
-        rows = await meals_today(chat_id, user_id)
-        if not rows:
-            await msg.reply(f"{mention}, сегодня нет записанных приёмов пищи. Кинь фото еды 🙂")
-            return True
-        total = 0
-        known = 0
-        for _, _, low, high, _ in rows:
-            mid = kcal_mid(low, high)
-            if mid is not None:
-                total += mid
-                known += 1
-        if known == 0:
-            await msg.reply(f"{mention}, приёмы есть, но без калорий. Кинь фото с подписью — будет точнее.")
-            return True
-        await msg.reply(f"{mention}, примерно съедено сегодня: ~{total} ккал (по {known} приёмам).")
+        intake, meals_cnt, known_cnt = await total_intake_today(chat_id, user_id)
+        await msg.reply(f"{mention}, сегодня съел примерно ~{intake} ккал (приёмов: {meals_cnt}, с калориями: {known_cnt}).")
         return True
 
     if ASK_BURNED_TODAY_RE.search(text):
         steps = await steps_today(chat_id, user_id)
         weight_kg = float(prof[2]) if prof else None
         burned = estimate_burned_kcal_from_steps(steps, weight_kg)
-        await msg.reply(f"{mention}, сегодня шагов: {steps} → примерно потрачено {burned} ккал (очень грубо).")
+        await msg.reply(f"{mention}, сегодня шагов: {steps} → примерно потрачено {burned} ккал (грубо).")
         return True
 
     if ASK_BALANCE_RE.search(text):
-        rows = await meals_today(chat_id, user_id)
-        intake = 0
-        for _, _, low, high, _ in rows:
-            mid = kcal_mid(low, high)
-            if mid is not None:
-                intake += mid
+        intake, _, _ = await total_intake_today(chat_id, user_id)
         steps = await steps_today(chat_id, user_id)
         weight_kg = float(prof[2]) if prof else None
         burned = estimate_burned_kcal_from_steps(steps, weight_kg)
         balance = intake - burned
         sign = "+" if balance > 0 else ""
-        await msg.reply(f"{mention}, баланс сегодня (очень примерно): {sign}{balance} ккал.\nСъел ~{intake}, Сжёг ~{burned}.")
+        await msg.reply(f"{mention}, баланс сегодня (очень примерно): {sign}{balance} ккал.\nСъел ~{intake}, шагами ~{burned}.")
+        return True
+
+    if ASK_SUMMARY_RE.search(text):
+        await msg.reply(await day_summary_text(chat_id, user_id))
         return True
 
     return False
@@ -707,16 +734,16 @@ async def on_text(msg: Message):
     name = prof[0] if prof else (msg.from_user.first_name or "Ты")
     mention = mention_user_html(msg, name)
 
-    # 1) Если есть pending-fix (после нажатия кнопки)
+    # pending-fix (после кнопки)
     pending = await get_pending_fix(msg.chat.id, user_id)
     if pending:
         bot_msg_id, created_at = pending
-        # TTL 10 минут
         try:
             created_dt = datetime.fromisoformat(created_at).astimezone(TZ)
         except Exception:
             created_dt = datetime.now(TZ)
 
+        # TTL 10 минут
         if datetime.now(TZ) - created_dt <= timedelta(minutes=10):
             corr = extract_correction_text(t)
             if corr:
@@ -739,12 +766,9 @@ async def on_text(msg: Message):
                 await clear_pending_fix(msg.chat.id, user_id)
 
                 return await msg.reply(f"{mention}, принял уточнение ✅\n\n{new_analysis}")
-            else:
-                await clear_pending_fix(msg.chat.id, user_id)
-        else:
-            await clear_pending_fix(msg.chat.id, user_id)
+        await clear_pending_fix(msg.chat.id, user_id)
 
-    # 2) Reply-правка (если отвечают на сообщение бота)
+    # Reply-правка на сообщение бота
     if msg.reply_to_message and msg.reply_to_message.from_user and msg.reply_to_message.from_user.is_bot:
         corr = extract_correction_text(t)
         if corr:
@@ -764,11 +788,11 @@ async def on_text(msg: Message):
                 await update_meal_by_bot_message(msg.chat.id, bot_msg_id, new_title, low, high)
                 return await msg.reply(f"{mention}, принял уточнение ✅\n\n{new_analysis}")
 
-    # 3) Вопросы
+    # Вопросы
     if await answer_questions(msg, mention, prof):
         return
 
-    # 4) Вес
+    # Вес цифрой
     mw = WEIGHT_RE.search(t)
     if mw:
         raw = mw.group(1).replace(",", ".")
@@ -780,13 +804,18 @@ async def on_text(msg: Message):
             await save_weight(msg.chat.id, user_id, w)
             return await msg.reply(f"{mention}, вес записал: {w:.1f} кг ✅")
 
-    # 5) Шаги
+    # Шаги цифрой — и если это вечер (после 21:30) или рядом с напоминанием — сразу саммари
     ms = STEPS_RE.search(t)
     if ms:
         s = int(ms.group(1))
         if 300 <= s <= 100000:
             await save_steps(msg.chat.id, user_id, s)
-            return await msg.reply(f"{mention}, шаги записал: {s} ✅")
+            await msg.reply(f"{mention}, шаги записал: {s} ✅")
+
+            now = datetime.now(TZ)
+            if now.hour >= 21:  # чтобы работало “после вечернего отчета”
+                await msg.reply(await day_summary_text(msg.chat.id, user_id))
+            return
 
 
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}) & F.photo)
@@ -811,18 +840,16 @@ async def on_food_photo(msg: Message):
         mm = re.search(r"Блюдо:\s*(.+)", analysis)
         title = mm.group(1).strip() if mm else "Еда"
 
-    today_rows = await meals_today(msg.chat.id, user_id)
-    warn = snacking_warning([r[0] for r in today_rows] + [datetime.now(TZ).isoformat(timespec="seconds")])
-
     out = f"{mention}, вот что вижу:\n\n{analysis}"
-    if warn:
-        out += f"\n\n🟡 {warn}"
 
-    sent = await msg.reply(out, reply_markup=correction_keyboard(0))  # временно, обновим ниже
-    # сохранить еду с message_id ответа бота
+    sent = await msg.reply(out, reply_markup=correction_keyboard(0))
     await save_meal(msg.chat.id, user_id, title, low, high, sent.message_id)
 
-    # обновим кнопку, чтобы в callback был правильный message_id
+    # подсчёт дневных калорий и вывод прогресса
+    intake, meals_cnt, known_cnt = await total_intake_today(msg.chat.id, user_id)
+    out2 = f"{mention}, <b>сегодня уже</b>: ~{intake} ккал (приёмов: {meals_cnt})."
+    await msg.reply(out2)
+
     try:
         await bot.edit_message_reply_markup(
             chat_id=msg.chat.id,
@@ -843,12 +870,17 @@ async def send_to_bound(text: str):
         except Exception:
             pass
 
+async def evening_steps_reminder():
+    # только напоминание, саммари выдаём после того как человек скинул шаги
+    await send_to_bound("🚶 22:00 — скинь скрин шагов или напиши число шагов (например: 8400). После этого дам сводку за день.")
+
 def setup_scheduler():
     sched = AsyncIOScheduler(timezone=TZ)
     sched.add_job(send_to_bound, "cron", hour=WATER_HOUR, minute=WATER_MIN, args=["🥤 07:00 — стакан воды."])
-    sched.add_job(send_to_bound, "cron", hour=STEPS_HOUR, minute=STEPS_MIN, args=["🚶 22:00 — скинь скрин шагов (или напиши цифрой)."])
+    sched.add_job(evening_steps_reminder, "cron", hour=STEPS_HOUR, minute=STEPS_MIN)
     sched.add_job(send_to_bound, "cron", day_of_week=WEIGH_DOW, hour=WEIGH_HOUR, minute=WEIGH_MIN, args=["⚖️ Взвешивание: скинь фото весов или напиши вес (например: 79.4)."])
     sched.start()
+
 
 async def main():
     await init_db()
