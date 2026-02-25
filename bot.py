@@ -2,13 +2,12 @@ import os
 import re
 import base64
 import asyncio
-import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ChatType
+from aiogram.enums import ChatType, ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -28,11 +27,10 @@ if not BOT_TOKEN:
 TZ_NAME = os.getenv("TZ", "Asia/Almaty")
 TZ = ZoneInfo(TZ_NAME)
 
-DB_PATH = os.getenv("DB_PATH", "foodbot.db")  # для Railway Volume: /data/foodbot.db
-ANTI_SPAM_SECONDS = int(os.getenv("ANTI_SPAM_SECONDS", "45"))
+DB_PATH = os.getenv("DB_PATH", "foodbot.db")  # Railway Volume: /data/foodbot.db
 DEBUG = os.getenv("DEBUG", "0").strip() == "1"
 
-# Groq
+# Groq (OpenAI-compatible)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct").strip()
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
@@ -49,7 +47,7 @@ WEIGH_HOUR = int(os.getenv("WEIGH_HOUR", "10"))
 WEIGH_MIN = int(os.getenv("WEIGH_MIN", "0"))
 
 storage = MemoryStorage()
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher(storage=storage)
 
 # =======================
@@ -59,16 +57,17 @@ WEIGHT_RE = re.compile(r"(?:^|\b)(?:вес\s*)?(\d{2,3}(?:[.,]\d)?)\b", re.IGNOR
 STEPS_RE = re.compile(r"(?:^|\b)(\d{3,6})\s*(?:шаг(?:ов|а)?|steps)?\b", re.IGNORECASE)
 
 ASK_MY_WEIGHT_RE = re.compile(r"(какой\s+мой\s+вес|мой\s+вес\s+сейчас|сколько\s+я\s+вешу)", re.IGNORECASE)
-ASK_EATEN_TODAY_RE = re.compile(r"(сколько\s+я\s+съел|сколько\s+я\s+съела|сколько\s+калори(й|и)\s+сегодня\s+съел|сколько\s+калори(й|и)\s+сегодня\s+съела)", re.IGNORECASE)
-ASK_BURNED_TODAY_RE = re.compile(r"(сколько\s+я\s+сж(е|ё)г|сколько\s+я\s+израсходовал|сколько\s+я\s+потратил|калори(й|и)\s+сж(е|ё)г\s+сегодня|израсходовал\s+сегодня)", re.IGNORECASE)
+ASK_EATEN_TODAY_RE = re.compile(r"(сколько\s+я\s+съел|сколько\s+я\s+съела|сколько\s+калори(й|и)\s+сегодня\s+съел|сколько\s+калори(й|и)\s+сегодня\s+съела|сколько\s+я\s+съел\s+сегодня|сколько\s+я\s+съела\s+сегодня)", re.IGNORECASE)
+ASK_BURNED_TODAY_RE = re.compile(r"(сколько\s+я\s+сж(е|ё)г|сколько\s+я\s+израсходовал|сколько\s+я\s+потратил|калори(й|и)\s+сж(е|ё)г\s+сегодня|израсходовал\s+сегодня|потратил\s+сегодня)", re.IGNORECASE)
 ASK_BALANCE_RE = re.compile(r"(баланс\s+калори(й|и)|профицит|дефицит)\b", re.IGNORECASE)
 
-# Калории из текста модели: "Калории: 650-850 ккал"
+# Parse calories line: "Калории: 650-850 ккал"
 CAL_RANGE_RE = re.compile(r"Калор(ии|ий|ии):\s*([0-9]{2,4})\s*[-–]\s*([0-9]{2,4})", re.IGNORECASE)
 
 DEFAULT_RULES = (
     "Я оцениваю еду по: белок / овощи(клетчатка) / сладкое / жирное / порция / соусы.\n"
-    "Отвечаю форматом: Блюдо, Оценка 1–10, Калории (примерно диапазоном), Почему, Совет.\n"
+    "Отвечаю форматом:\n"
+    "Блюдо / Оценка 1–10 / Калории (примерно диапазоном) / Почему / Совет.\n"
     "Калории по фото — всегда приблизительно."
 )
 
@@ -83,6 +82,13 @@ class ProfileFlow(StatesGroup):
 # =======================
 # Helpers
 # =======================
+def mention_user_html(msg: Message, fallback_name: str) -> str:
+    u = msg.from_user
+    if u and u.username:
+        return f"@{u.username}"
+    safe_name = (fallback_name or "пользователь").replace("<", "").replace(">", "")
+    return f'<a href="tg://user?id={u.id}">{safe_name}</a>'
+
 def guess_mime(file_path: str) -> str:
     fp = (file_path or "").lower()
     if fp.endswith(".png"):
@@ -99,7 +105,8 @@ def parse_kcal_range(text: str):
     m = CAL_RANGE_RE.search(text or "")
     if not m:
         return (None, None)
-    low = int(m.group(2)); high = int(m.group(3))
+    low = int(m.group(2))
+    high = int(m.group(3))
     if low > high:
         low, high = high, low
     return (low, high)
@@ -110,25 +117,28 @@ def kcal_mid(low, high):
     return int(round((low + high) / 2))
 
 def estimate_burned_kcal_from_steps(steps: int, weight_kg: float | None):
-    base_per_step = 0.04  # грубо: 10k ~ 400 ккал
+    # очень грубо: 10k шагов ~ 400 ккал для 70 кг
+    base_per_step = 0.04
     factor = (weight_kg / 70.0) if weight_kg else 1.0
     return int(round(steps * base_per_step * factor))
 
 def snacking_warning(meals_rows):
-    # meals_rows: list of (dt, title, low, high)
+    # meals_rows: list of (dt, title, low, high) sorted ASC
     if not meals_rows:
         return None
+
     if len(meals_rows) >= 5:
         return ("Похоже, сегодня очень часто ешь (много перекусов). "
                 "Если это «на автомате», попробуй: 2–3 основных приёма + один нормальный перекус "
-                "(белок + клетчатка), чтобы не тянуться к еде каждые 30–60 минут.")
-    # 3 приёма за 2 часа
+                "(белок + клетчатка), чтобы реже тянуло есть.")
+
     times = []
     for dt_str, *_ in meals_rows:
         try:
             times.append(datetime.fromisoformat(dt_str).astimezone(TZ))
         except Exception:
             pass
+
     for i in range(len(times) - 2):
         if (times[i + 2] - times[i]) <= timedelta(hours=2):
             return ("Вижу несколько приёмов пищи очень близко по времени. "
@@ -190,18 +200,11 @@ async def init_db():
             kcal_high INTEGER
         )""")
 
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS last_actions(
-            chat_id INTEGER PRIMARY KEY,
-            last_food_ts INTEGER DEFAULT 0
-        )""")
-
         await db.commit()
 
 async def ensure_chat(chat_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR IGNORE INTO chats(chat_id) VALUES(?)", (chat_id,))
-        await db.execute("INSERT OR IGNORE INTO last_actions(chat_id) VALUES(?)", (chat_id,))
         await db.commit()
 
 async def set_bound(chat_id: int, bound: int):
@@ -225,18 +228,6 @@ async def get_goal(chat_id: int) -> str:
         cur = await db.execute("SELECT goal FROM chats WHERE chat_id=?", (chat_id,))
         row = await cur.fetchone()
         return row[0] if row else "maintain"
-
-async def can_analyze_food(chat_id: int) -> bool:
-    now = int(time.time())
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT last_food_ts FROM last_actions WHERE chat_id=?", (chat_id,))
-        row = await cur.fetchone()
-        last_ts = row[0] if row else 0
-        if now - last_ts < ANTI_SPAM_SECONDS:
-            return False
-        await db.execute("UPDATE last_actions SET last_food_ts=? WHERE chat_id=?", (now, chat_id))
-        await db.commit()
-        return True
 
 async def upsert_profile(chat_id: int, user_id: int, name: str, height_cm: int, weight_kg: float):
     ts = datetime.now(TZ).isoformat(timespec="seconds")
@@ -263,7 +254,8 @@ async def get_profile(chat_id: int, user_id: int):
 async def save_weight(chat_id: int, user_id: int, w: float):
     ts = datetime.now(TZ).isoformat(timespec="seconds")
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO weights(chat_id, user_id, dt, weight) VALUES(?,?,?,?)", (chat_id, user_id, ts, w))
+        await db.execute("INSERT INTO weights(chat_id, user_id, dt, weight) VALUES(?,?,?,?)",
+                         (chat_id, user_id, ts, w))
         await db.commit()
 
 async def last_weight(chat_id: int, user_id: int):
@@ -277,7 +269,8 @@ async def last_weight(chat_id: int, user_id: int):
 async def save_steps(chat_id: int, user_id: int, s: int):
     ts = datetime.now(TZ).isoformat(timespec="seconds")
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO steps(chat_id, user_id, dt, steps) VALUES(?,?,?,?)", (chat_id, user_id, ts, s))
+        await db.execute("INSERT INTO steps(chat_id, user_id, dt, steps) VALUES(?,?,?,?)",
+                         (chat_id, user_id, ts, s))
         await db.commit()
 
 async def steps_today(chat_id: int, user_id: int) -> int:
@@ -316,7 +309,7 @@ async def meals_today(chat_id: int, user_id: int):
 # =======================
 async def analyze_food(photo_file_id: str, goal: str, user_context: str, caption: str | None):
     if not groq_client:
-        return "Groq не настроен: добавь GROQ_API_KEY в Railway Variables."
+        return "⚠️ Groq не настроен: добавь GROQ_API_KEY в Railway Variables."
 
     tg_file = await bot.get_file(photo_file_id)
     bio = await bot.download_file(tg_file.file_path)
@@ -330,8 +323,8 @@ async def analyze_food(photo_file_id: str, goal: str, user_context: str, caption
         "bulk": "Упор на белок и качество еды, без мусора."
     }.get(goal, "Баланс: по делу, без жесткача.")
 
-    caption = (caption or "").strip()
-    caption_line = f"Подпись к фото: {caption}" if caption else "Подписи нет."
+    cap = (caption or "").strip()
+    caption_line = f"Подпись к фото: {cap}" if cap else "Подписи нет."
 
     prompt = f"""
 Ты — помощник по питанию. {strictness}
@@ -371,8 +364,23 @@ async def analyze_food(photo_file_id: str, goal: str, user_context: str, caption
         text = (resp.choices[0].message.content or "").strip()
         return text if text else "Не смог распознать по фото 😅 Попробуй другое фото или подпиши."
     except Exception as e:
-        print("Groq error:", repr(e))
-        return f"Не смог обработать фото 😅" + (f"\n(ошибка: {repr(e)[:160]})" if DEBUG else "")
+        err = repr(e)
+        print("Groq error:", err)
+
+        low = err.lower()
+        hint = "Не смог обработать фото 😅"
+        if "401" in low or "unauthorized" in low or "invalid api key" in low:
+            hint = "Не могу обратиться к Groq: проблема с API ключом (проверь GROQ_API_KEY)."
+        elif "429" in low or "rate" in low or "quota" in low:
+            hint = "Groq ограничил запросы (лимит/частота). Подожди немного и попробуй снова."
+        elif "model" in low and ("not found" in low or "does not exist" in low):
+            hint = "Модель Groq не найдена. Проверь GROQ_MODEL."
+        elif "timeout" in low:
+            hint = "Groq долго отвечает (таймаут). Попробуй ещё раз через 10–20 секунд."
+
+        if DEBUG:
+            return f"⚠️ {hint}\n\nDEBUG: {err[:240]}"
+        return f"⚠️ {hint}\nСовет: добавь подпись к фото — так точнее."
 
 # =======================
 # Commands / Profile
@@ -456,7 +464,8 @@ async def prof_weight(msg: Message, state: FSMContext):
         return await msg.reply("Похоже на ошибку. Вес в кг (пример: 82.4).")
 
     data = await state.get_data()
-    name = data.get("name"); height = data.get("height")
+    name = data.get("name")
+    height = data.get("height")
     user_id = msg.from_user.id
 
     await upsert_profile(0, user_id, name, int(height), float(w))
@@ -471,7 +480,8 @@ async def cmd_linkprofile(msg: Message):
 
     user_id = msg.from_user.id
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT name, height_cm, weight_kg FROM profiles WHERE chat_id=0 AND user_id=?", (user_id,))
+        cur = await db.execute("SELECT name, height_cm, weight_kg FROM profiles WHERE chat_id=0 AND user_id=?",
+                               (user_id,))
         row = await cur.fetchone()
 
     if not row:
@@ -484,7 +494,7 @@ async def cmd_linkprofile(msg: Message):
 # =======================
 # Q&A in group
 # =======================
-async def answer_questions(msg: Message, name: str, prof):
+async def answer_questions(msg: Message, mention: str, prof):
     chat_id = msg.chat.id
     user_id = msg.from_user.id
     text = (msg.text or "").strip()
@@ -492,40 +502,53 @@ async def answer_questions(msg: Message, name: str, prof):
     if ASK_MY_WEIGHT_RE.search(text):
         lw = await last_weight(chat_id, user_id)
         if not lw:
-            return await msg.reply(f"{name}, у меня пока нет твоего веса. Напиши, например: 82.4")
-        return await msg.reply(f"{name}, последний записанный вес: {float(lw[1]):.1f} кг ({lw[0]})")
+            await msg.reply(f"{mention}, у меня пока нет твоего веса. Напиши, например: 82.4")
+            return True
+        await msg.reply(f"{mention}, последний записанный вес: {float(lw[1]):.1f} кг ({lw[0]})")
+        return True
 
     if ASK_EATEN_TODAY_RE.search(text):
         rows = await meals_today(chat_id, user_id)
         if not rows:
-            return await msg.reply(f"{name}, сегодня нет записанных приёмов пищи. Кинь фото еды 🙂")
-        total = 0; known = 0
+            await msg.reply(f"{mention}, сегодня нет записанных приёмов пищи. Кинь фото еды 🙂")
+            return True
+        total = 0
+        known = 0
         for _, _, low, high in rows:
             mid = kcal_mid(low, high)
             if mid is not None:
-                total += mid; known += 1
+                total += mid
+                known += 1
         if known == 0:
-            return await msg.reply(f"{name}, приёмы есть, но без калорий. Кинь фото с подписью — будет точнее.")
-        return await msg.reply(f"{name}, примерно съедено сегодня: ~{total} ккал (по {known} приёмам).")
+            await msg.reply(f"{mention}, приёмы есть, но без калорий. Кинь фото с подписью — будет точнее.")
+            return True
+        await msg.reply(f"{mention}, примерно съедено сегодня: ~{total} ккал (по {known} приёмам).")
+        return True
 
     if ASK_BURNED_TODAY_RE.search(text):
         steps = await steps_today(chat_id, user_id)
         weight_kg = float(prof[2]) if prof else None
         burned = estimate_burned_kcal_from_steps(steps, weight_kg)
-        return await msg.reply(f"{name}, сегодня шагов: {steps} → примерно потрачено {burned} ккал (грубо).")
+        await msg.reply(f"{mention}, сегодня шагов: {steps} → примерно потрачено {burned} ккал (очень грубо).")
+        return True
 
     if ASK_BALANCE_RE.search(text):
         rows = await meals_today(chat_id, user_id)
-        intake = 0; known = 0
+        intake = 0
+        known = 0
         for _, _, low, high in rows:
             mid = kcal_mid(low, high)
             if mid is not None:
-                intake += mid; known += 1
+                intake += mid
+                known += 1
+
         steps = await steps_today(chat_id, user_id)
-        burned = estimate_burned_kcal_from_steps(steps, float(prof[2]) if prof else None)
+        weight_kg = float(prof[2]) if prof else None
+        burned = estimate_burned_kcal_from_steps(steps, weight_kg)
         balance = intake - burned
         sign = "+" if balance > 0 else ""
-        return await msg.reply(f"{name}, баланс сегодня (очень примерно): {sign}{balance} ккал.\nСъел ~{intake}, Сжёг шагами ~{burned}.")
+        await msg.reply(f"{mention}, баланс сегодня (очень примерно): {sign}{balance} ккал.\nСъел ~{intake}, Сжёг шагами ~{burned}.")
+        return True
 
     return False
 
@@ -535,21 +558,22 @@ async def answer_questions(msg: Message, name: str, prof):
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}) & F.photo)
 async def on_food_photo(msg: Message):
     await ensure_chat(msg.chat.id)
-    if not await can_analyze_food(msg.chat.id):
-        return
 
     user_id = msg.from_user.id
     prof = await get_profile(msg.chat.id, user_id)
     name = prof[0] if prof else (msg.from_user.first_name or "Ты")
+    mention = mention_user_html(msg, name)
 
     user_context = "нет"
     if prof:
         user_context = f"Имя: {prof[0]}, Рост: {prof[1]} см, Вес: {prof[2]} кг"
 
     goal = await get_goal(msg.chat.id)
+
     analysis = await analyze_food(msg.photo[-1].file_id, goal, user_context, msg.caption)
 
     low, high = parse_kcal_range(analysis)
+
     title = (msg.caption or "").strip()
     if not title:
         m = re.search(r"Блюдо:\s*(.+)", analysis)
@@ -560,7 +584,7 @@ async def on_food_photo(msg: Message):
     today_rows = await meals_today(msg.chat.id, user_id)
     warn = snacking_warning(today_rows)
 
-    out = f"{name}, вот что вижу:\n\n{analysis}"
+    out = f"{mention}, вот что вижу:\n\n{analysis}"
     if warn:
         out += f"\n\n🟡 {warn}"
     await msg.reply(out)
@@ -573,9 +597,9 @@ async def on_text(msg: Message):
     user_id = msg.from_user.id
     prof = await get_profile(msg.chat.id, user_id)
     name = prof[0] if prof else (msg.from_user.first_name or "Ты")
+    mention = mention_user_html(msg, name)
 
-    answered = await answer_questions(msg, name, prof)
-    if answered:
+    if await answer_questions(msg, mention, prof):
         return
 
     mw = WEIGHT_RE.search(t)
@@ -587,13 +611,14 @@ async def on_text(msg: Message):
             w = None
         if w and 30.0 <= w <= 300.0:
             await save_weight(msg.chat.id, user_id, w)
-            return await msg.reply(f"{name}, вес записал: {w:.1f} кг ✅")
+            return await msg.reply(f"{mention}, вес записал: {w:.1f} кг ✅")
+
     ms = STEPS_RE.search(t)
     if ms:
         s = int(ms.group(1))
         if 300 <= s <= 100000:
             await save_steps(msg.chat.id, user_id, s)
-            return await msg.reply(f"{name}, шаги записал: {s} ✅")
+            return await msg.reply(f"{mention}, шаги записал: {s} ✅")
 
 # =======================
 # Reminders
