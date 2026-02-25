@@ -1,0 +1,5 @@
+aiogram==3.*
+apscheduler
+aiosqlite
+python-dotenv
+google-genai
